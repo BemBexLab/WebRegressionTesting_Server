@@ -29,8 +29,34 @@ create table if not exists public.scans (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.page_baselines (
+  id uuid primary key default gen_random_uuid(),
+  website_id uuid not null references public.websites(id) on delete cascade,
+  page_path text not null,
+  baseline_image_path text not null,
+  baseline_html text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (website_id, page_path)
+);
+
+create table if not exists public.code_repo_baselines (
+  id uuid primary key default gen_random_uuid(),
+  owner text not null,
+  repo text not null,
+  repository_url text not null,
+  branch text not null,
+  commit_sha text not null,
+  commit_url text,
+  committed_at timestamptz,
+  updated_at timestamptz not null default now(),
+  unique (owner, repo)
+);
+
 alter table public.websites enable row level security;
 alter table public.scans enable row level security;
+alter table public.page_baselines enable row level security;
+alter table public.code_repo_baselines enable row level security;
 
 drop policy if exists "Allow read websites" on public.websites;
 create policy "Allow read websites"
@@ -44,5 +70,19 @@ on public.scans
 for select
 using (true);
 
+drop policy if exists "Allow read page baselines" on public.page_baselines;
+create policy "Allow read page baselines"
+on public.page_baselines
+for select
+using (true);
+
+drop policy if exists "Allow read code repo baselines" on public.code_repo_baselines;
+create policy "Allow read code repo baselines"
+on public.code_repo_baselines
+for select
+using (true);
+
 alter publication supabase_realtime add table public.websites;
 alter publication supabase_realtime add table public.scans;
+alter publication supabase_realtime add table public.page_baselines;
+alter publication supabase_realtime add table public.code_repo_baselines;

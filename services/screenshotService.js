@@ -78,7 +78,6 @@ async function stabilizePage(page) {
 
 export async function captureScreenshot({
   url,
-  outputPath,
   viewport = "desktop",
   ignoredSelectors = []
 }) {
@@ -103,13 +102,10 @@ export async function captureScreenshot({
       await page.addStyleTag({ content: css });
     }
 
-    await page.screenshot({
-      path: outputPath,
-      fullPage: true
-    });
+    const imageBuffer = await page.screenshot({ fullPage: true });
 
     const html = await page.content();
-    return html;
+    return { html, imageBuffer };
   } finally {
     await browser.close();
   }

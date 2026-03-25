@@ -1,31 +1,26 @@
 import { randomUUID } from "crypto";
-import path from "path";
-import {
-  copyFileSync,
-  existsSync,
-  readFileSync,
-  statSync,
-  writeFileSync
-} from "fs";
-import { ensureDirSync } from "fs-extra";
 import { Router } from "express";
-import { fileURLToPath } from "url";
 
 import { supabase } from "../lib/supabase.js";
-import { compareDOM } from "../services/domDiffService.js";
 import { crawlSitePages } from "../services/crawlService.js";
+import { compareDOM } from "../services/domDiffService.js";
 import { scanGitHubRepository } from "../services/githubRepoService.js";
+import { generateReportPdf } from "../services/reportService.js";
 import { captureScreenshot } from "../services/screenshotService.js";
 import { compareImages } from "../services/visualDiffService.js";
-import { generateReportPdf } from "../services/reportService.js";
 
 const router = Router();
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const STORAGE_ROOT = path.resolve(__dirname, "../storage");
 const MAX_PAGES_PER_SCAN = Number(process.env.MAX_PAGES_PER_SCAN) || 0;
 const PIXELMATCH_THRESHOLD = Number(process.env.PIXELMATCH_THRESHOLD) || 0.2;
+const SUPABASE_SCAN_BUCKET = process.env.SUPABASE_SCAN_BUCKET || "scan-artifacts";
+const STORAGE_UPLOAD_RETRIES = Math.max(1, Number(process.env.STORAGE_UPLOAD_RETRIES) || 4);
+const STORAGE_UPLOAD_RETRY_DELAY_MS = Math.max(
+  100,
+  Number(process.env.STORAGE_UPLOAD_RETRY_DELAY_MS) || 1200
+);
 const scanJobs = new Map();
+
+let scanBucketReadyPromise = null;
 
 function normalizeErrorMessage(error) {
   const raw = error instanceof Error ? error.message : String(error ?? "Unknown scan failure.");
@@ -83,46 +78,115 @@ function hashString(value = "") {
   return hash.toString(16);
 }
 
-function getSiteStorageRoot(websiteId) {
-  return path.join(STORAGE_ROOT, "sites", websiteId);
-}
-
-function getPageArtifactPaths({ websiteId, pagePath, timestamp }) {
+function getPageArtifactKeys({ websiteId, pagePath, timestamp }) {
   const pageKey = getPageKey(pagePath);
   const pageStem = `${pageKey}-${hashString(pagePath)}`;
-  const siteRoot = getSiteStorageRoot(websiteId);
 
   return {
     pageId: pageStem,
-    baselineImagePath: path.join(siteRoot, "baseline", `${pageStem}.png`),
-    baselineHtmlPath: path.join(siteRoot, "baseline-html", `${pageStem}.html`),
-    currentImagePath: path.join(siteRoot, "current", `${pageStem}-${timestamp}.png`),
-    diffImagePath: path.join(siteRoot, "diff", `${pageStem}-${timestamp}.png`)
+    baselineImageKey: `sites/${websiteId}/baseline/${pageStem}.png`,
+    currentImageKey: `sites/${websiteId}/current/${pageStem}-${timestamp}.png`,
+    diffImageKey: `sites/${websiteId}/diff/${pageStem}-${timestamp}.png`,
+    baselineSnapshotKey: `sites/${websiteId}/baseline-history/${pageStem}-${timestamp}.png`
   };
 }
 
-function ensureStorageDirs(websiteId) {
-  ensureDirSync(path.join(STORAGE_ROOT, "baseline"));
-  ensureDirSync(path.join(STORAGE_ROOT, "current"));
-  ensureDirSync(path.join(STORAGE_ROOT, "diff"));
-
-  const siteRoot = getSiteStorageRoot(websiteId);
-  ensureDirSync(path.join(siteRoot, "baseline"));
-  ensureDirSync(path.join(siteRoot, "baseline-history"));
-  ensureDirSync(path.join(siteRoot, "baseline-html"));
-  ensureDirSync(path.join(siteRoot, "current"));
-  ensureDirSync(path.join(siteRoot, "diff"));
+function toPublicStorageUrl(objectKey) {
+  const { data } = supabase.storage.from(SUPABASE_SCAN_BUCKET).getPublicUrl(objectKey);
+  return data.publicUrl;
 }
 
-function fileToPublicUrl(filePath) {
-  const rel = path.relative(STORAGE_ROOT, filePath).replace(/\\/g, "/");
-
-  try {
-    const version = Math.floor(statSync(filePath).mtimeMs);
-    return `/storage/${rel}?v=${version}`;
-  } catch {
-    return `/storage/${rel}`;
+function isSupabaseObjectKey(value) {
+  if (!value || typeof value !== "string") {
+    return false;
   }
+
+  if (/^https?:\/\//i.test(value)) {
+    return false;
+  }
+
+  if (value.startsWith("/storage/")) {
+    return false;
+  }
+
+  if (/^[a-zA-Z]:\\/.test(value)) {
+    return false;
+  }
+
+  return true;
+}
+
+async function ensureScanBucket() {
+  if (!scanBucketReadyPromise) {
+    scanBucketReadyPromise = (async () => {
+      const { data: buckets, error: listError } = await supabase.storage.listBuckets();
+
+      if (listError) {
+        throw new Error(`Failed to list Supabase buckets: ${listError.message}`);
+      }
+
+      const exists = (buckets ?? []).some((bucket) => bucket.name === SUPABASE_SCAN_BUCKET);
+
+      if (exists) {
+        return;
+      }
+
+      const { error: createError } = await supabase.storage.createBucket(SUPABASE_SCAN_BUCKET, {
+        public: true
+      });
+
+      if (createError && !/already exists/i.test(createError.message)) {
+        throw new Error(`Failed to create bucket '${SUPABASE_SCAN_BUCKET}': ${createError.message}`);
+      }
+    })();
+  }
+
+  return scanBucketReadyPromise;
+}
+
+async function uploadArtifact(objectKey, buffer, contentType) {
+  await ensureScanBucket();
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= STORAGE_UPLOAD_RETRIES; attempt += 1) {
+    const { error } = await supabase.storage
+      .from(SUPABASE_SCAN_BUCKET)
+      .upload(objectKey, buffer, { contentType, upsert: true });
+
+    if (!error) {
+      return toPublicStorageUrl(objectKey);
+    }
+
+    lastError = error;
+    const rawMessage = String(error.message || "");
+    const transient =
+      /bad gateway|gateway|502|503|504|timeout|temporar/i.test(rawMessage);
+
+    if (!transient || attempt === STORAGE_UPLOAD_RETRIES) {
+      break;
+    }
+
+    const backoffMs = STORAGE_UPLOAD_RETRY_DELAY_MS * attempt;
+    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+  }
+
+  const sizeMb = (buffer.length / (1024 * 1024)).toFixed(2);
+  throw new Error(
+    `Failed to upload '${objectKey}' to Supabase Storage after ${STORAGE_UPLOAD_RETRIES} attempt(s). ` +
+      `Size=${sizeMb}MB. Last error: ${lastError?.message || "Unknown upload error"}`
+  );
+}
+
+async function downloadArtifact(objectKey) {
+  await ensureScanBucket();
+  const { data, error } = await supabase.storage.from(SUPABASE_SCAN_BUCKET).download(objectKey);
+
+  if (error) {
+    throw new Error(`Failed to download '${objectKey}' from Supabase Storage: ${error.message}`);
+  }
+
+  const arrayBuffer = await data.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 async function getOrCreateWebsite(url) {
@@ -162,30 +226,76 @@ async function getOrCreateWebsite(url) {
   return created;
 }
 
-function getBaselineHtml({ website, pagePath, baselineHtmlPath }) {
-  if (pagePath === "/" && website.baseline_html) {
-    return website.baseline_html;
+async function getPageBaseline({ website, pagePath }) {
+  const { data, error } = await supabase
+    .from("page_baselines")
+    .select("*")
+    .eq("website_id", website.id)
+    .eq("page_path", pagePath)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
   }
 
-  if (existsSync(baselineHtmlPath)) {
-    return readFileSync(baselineHtmlPath, "utf8");
+  if (data) {
+    return data;
   }
 
-  return "";
+  if (
+    pagePath === "/" &&
+    website.baseline_html &&
+    website.baseline_image_path &&
+    isSupabaseObjectKey(website.baseline_image_path)
+  ) {
+    return {
+      website_id: website.id,
+      page_path: pagePath,
+      baseline_image_path: website.baseline_image_path,
+      baseline_html: website.baseline_html
+    };
+  }
+
+  return null;
 }
 
-async function persistBaseline({ website, pagePath, baselineImagePath, baselineHtmlPath, currentImagePath, html }) {
-  copyFileSync(currentImagePath, baselineImagePath);
-  writeFileSync(baselineHtmlPath, html, "utf8");
+async function upsertPageBaseline({ websiteId, pagePath, baselineImageKey, html }) {
+  const { error } = await supabase.from("page_baselines").upsert(
+    {
+      website_id: websiteId,
+      page_path: pagePath,
+      baseline_image_path: baselineImageKey,
+      baseline_html: html,
+      updated_at: new Date().toISOString()
+    },
+    {
+      onConflict: "website_id,page_path"
+    }
+  );
+
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+async function persistBaseline({ website, pagePath, baselineImageKey, currentImageBuffer, html }) {
+  const baselineImageUrl = await uploadArtifact(baselineImageKey, currentImageBuffer, "image/png");
+
+  await upsertPageBaseline({
+    websiteId: website.id,
+    pagePath,
+    baselineImageKey,
+    html
+  });
 
   if (pagePath !== "/") {
-    return;
+    return baselineImageUrl;
   }
 
   const { error } = await supabase
     .from("websites")
     .update({
-      baseline_image_path: baselineImagePath,
+      baseline_image_path: baselineImageKey,
       baseline_html: html
     })
     .eq("id", website.id);
@@ -193,22 +303,16 @@ async function persistBaseline({ website, pagePath, baselineImagePath, baselineH
   if (error) {
     throw new Error(error.message);
   }
+
+  return baselineImageUrl;
 }
 
-async function promoteCurrentToBaseline({
-  website,
-  pagePath,
-  baselineImagePath,
-  baselineHtmlPath,
-  currentImagePath,
-  html
-}) {
+async function promoteCurrentToBaseline({ website, pagePath, baselineImageKey, currentImageBuffer, html }) {
   await persistBaseline({
     website,
     pagePath,
-    baselineImagePath,
-    baselineHtmlPath,
-    currentImagePath,
+    baselineImageKey,
+    currentImageBuffer,
     html
   });
 }
@@ -270,40 +374,37 @@ function updateJob(jobId, patch) {
 
 async function scanPage({ website, pageUrl, timestamp }) {
   const pagePath = getPagePath(pageUrl);
-  const siteRoot = getSiteStorageRoot(website.id);
   const {
     pageId,
-    baselineImagePath,
-    baselineHtmlPath,
-    currentImagePath,
-    diffImagePath
-  } = getPageArtifactPaths({
+    baselineImageKey,
+    currentImageKey,
+    diffImageKey,
+    baselineSnapshotKey
+  } = getPageArtifactKeys({
     websiteId: website.id,
     pagePath,
     timestamp
   });
-  const baselineHtml = getBaselineHtml({
-    website,
-    pagePath,
-    baselineHtmlPath
-  });
-  const baselineImage =
-    pagePath === "/" && website.baseline_image_path ? website.baseline_image_path : baselineImagePath;
 
-  const html = await captureScreenshot({
+  const { html, imageBuffer } = await captureScreenshot({
     url: pageUrl,
-    outputPath: currentImagePath,
     viewport: website.viewport || "desktop",
     ignoredSelectors: Array.isArray(website.ignored_selectors) ? website.ignored_selectors : []
   });
 
-  if (!existsSync(baselineImage) || !baselineHtml) {
-    await persistBaseline({
+  const currentImageUrl = await uploadArtifact(currentImageKey, imageBuffer, "image/png");
+  const baselineRecord = await getPageBaseline({ website, pagePath });
+  const baselineHtml = baselineRecord?.baseline_html || "";
+  const baselineImageObjectKey = isSupabaseObjectKey(baselineRecord?.baseline_image_path)
+    ? baselineRecord.baseline_image_path
+    : null;
+
+  if (!baselineImageObjectKey || !baselineHtml) {
+    const baselineImageUrl = await persistBaseline({
       website,
       pagePath,
-      baselineImagePath: baselineImage,
-      baselineHtmlPath,
-      currentImagePath,
+      baselineImageKey,
+      currentImageBuffer: imageBuffer,
       html
     });
 
@@ -317,8 +418,8 @@ async function scanPage({ website, pageUrl, timestamp }) {
         totalPixels: 0,
         mismatchPercentage: 0,
         status: "Pass",
-        baselineImageUrl: fileToPublicUrl(baselineImage),
-        currentImageUrl: fileToPublicUrl(currentImagePath),
+        baselineImageUrl,
+        currentImageUrl,
         diffImageUrl: null
       },
       domRegression: {
@@ -336,20 +437,60 @@ async function scanPage({ website, pageUrl, timestamp }) {
     };
   }
 
-  const visualDiff = compareImages(baselineImage, currentImagePath, diffImagePath, {
+  let baselineBuffer;
+  try {
+    baselineBuffer = await downloadArtifact(baselineImageObjectKey);
+  } catch {
+    const baselineImageUrl = await persistBaseline({
+      website,
+      pagePath,
+      baselineImageKey,
+      currentImageBuffer: imageBuffer,
+      html
+    });
+
+    return {
+      pageId,
+      url: pageUrl,
+      path: pagePath,
+      baselineCreated: true,
+      visualRegression: {
+        mismatchPixels: 0,
+        totalPixels: 0,
+        mismatchPercentage: 0,
+        status: "Pass",
+        baselineImageUrl,
+        currentImageUrl,
+        diffImageUrl: null
+      },
+      domRegression: {
+        summary: {
+          total: 0,
+          added: 0,
+          removed: 0,
+          attributeChanged: 0,
+          textChanged: 0,
+          severity: "None"
+        },
+        changedSelectors: [],
+        diffLog: []
+      }
+    };
+  }
+
+  const baselineImageUrl = await uploadArtifact(baselineSnapshotKey, baselineBuffer, "image/png");
+  const visualDiff = compareImages(baselineBuffer, imageBuffer, {
     threshold: PIXELMATCH_THRESHOLD,
     mismatchThresholdPercentage: Number(website.threshold_percentage) || 0.3
   });
+  const diffImageUrl = await uploadArtifact(diffImageKey, visualDiff.diffBuffer, "image/png");
   const domChanges = compareDOM(baselineHtml, html);
-  const baselineSnapshotPath = path.join(siteRoot, "baseline-history", `${pageId}-${timestamp}.png`);
 
-  copyFileSync(baselineImage, baselineSnapshotPath);
   await promoteCurrentToBaseline({
     website,
     pagePath,
-    baselineImagePath: baselineImage,
-    baselineHtmlPath,
-    currentImagePath,
+    baselineImageKey,
+    currentImageBuffer: imageBuffer,
     html
   });
 
@@ -359,10 +500,13 @@ async function scanPage({ website, pageUrl, timestamp }) {
     path: pagePath,
     baselineCreated: false,
     visualRegression: {
-      ...visualDiff,
-      baselineImageUrl: fileToPublicUrl(baselineSnapshotPath),
-      currentImageUrl: fileToPublicUrl(currentImagePath),
-      diffImageUrl: fileToPublicUrl(diffImagePath)
+      mismatchPixels: visualDiff.mismatchPixels,
+      totalPixels: visualDiff.totalPixels,
+      mismatchPercentage: visualDiff.mismatchPercentage,
+      status: visualDiff.status,
+      baselineImageUrl,
+      currentImageUrl,
+      diffImageUrl
     },
     domRegression: domChanges
   };
@@ -376,11 +520,12 @@ async function runScanJob({ jobId, url, githubUrl }) {
       message: "Preparing scan"
     });
 
+    await ensureScanBucket();
+
     const normalizedRootUrl = normalizePageUrl(url);
     const website = await getOrCreateWebsite(normalizedRootUrl);
     const siteName = website.site_key || sanitizeSiteName(new URL(normalizedRootUrl).hostname);
 
-    ensureStorageDirs(website.id);
     updateJob(jobId, {
       websiteId: website.id,
       siteName,
@@ -448,10 +593,7 @@ async function runScanJob({ jobId, url, githubUrl }) {
         message: "Checking GitHub repository changes"
       });
 
-      codeRegression = await scanGitHubRepository({
-        githubUrl,
-        storageRoot: STORAGE_ROOT
-      });
+      codeRegression = await scanGitHubRepository({ githubUrl });
     }
 
     updateJob(jobId, {

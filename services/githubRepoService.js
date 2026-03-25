@@ -1,6 +1,4 @@
-import path from "path";
-import { existsSync, readFileSync, writeFileSync } from "fs";
-import { ensureDirSync } from "fs-extra";
+import { supabase } from "../lib/supabase.js";
 
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -51,25 +49,40 @@ export function parseGitHubRepoUrl(input) {
   };
 }
 
-function getRepoBaselinePath(storageRoot, owner, repo) {
-  return path.join(storageRoot, "code-baselines", `${owner}__${repo}.json`);
-}
+async function readRepoBaseline(owner, repo) {
+  const { data, error } = await supabase
+    .from("code_repo_baselines")
+    .select("*")
+    .eq("owner", owner)
+    .eq("repo", repo)
+    .maybeSingle();
 
-function readRepoBaseline(storageRoot, owner, repo) {
-  const baselinePath = getRepoBaselinePath(storageRoot, owner, repo);
-
-  if (!existsSync(baselinePath)) {
-    return null;
+  if (error) {
+    throw new Error(error.message);
   }
 
-  return JSON.parse(readFileSync(baselinePath, "utf8"));
+  return data;
 }
 
-function writeRepoBaseline(storageRoot, owner, repo, snapshot) {
-  const baselineDir = path.join(storageRoot, "code-baselines");
-  ensureDirSync(baselineDir);
-  const baselinePath = getRepoBaselinePath(storageRoot, owner, repo);
-  writeFileSync(baselinePath, JSON.stringify(snapshot, null, 2), "utf8");
+async function writeRepoBaseline(snapshot) {
+  const { error } = await supabase
+    .from("code_repo_baselines")
+    .upsert(
+      {
+        owner: snapshot.owner,
+        repo: snapshot.repo,
+        repository_url: snapshot.repositoryUrl,
+        branch: snapshot.branch,
+        commit_sha: snapshot.commitSha,
+        commit_url: snapshot.commitUrl,
+        committed_at: snapshot.committedAt
+      },
+      { onConflict: "owner,repo" }
+    );
+
+  if (error) {
+    throw new Error(error.message);
+  }
 }
 
 async function getRepoSnapshot(owner, repo) {
@@ -98,13 +111,13 @@ function summarizeFiles(files = []) {
   };
 }
 
-export async function scanGitHubRepository({ githubUrl, storageRoot }) {
+export async function scanGitHubRepository({ githubUrl }) {
   const { owner, repo, normalizedUrl } = parseGitHubRepoUrl(githubUrl);
   const currentSnapshot = await getRepoSnapshot(owner, repo);
-  const baseline = readRepoBaseline(storageRoot, owner, repo);
+  const baseline = await readRepoBaseline(owner, repo);
 
   if (!baseline) {
-    writeRepoBaseline(storageRoot, owner, repo, currentSnapshot);
+    await writeRepoBaseline(currentSnapshot);
 
     return {
       baselineCreated: true,
@@ -124,12 +137,12 @@ export async function scanGitHubRepository({ githubUrl, storageRoot }) {
     };
   }
 
-  if (baseline.commitSha === currentSnapshot.commitSha) {
+  if (baseline.commit_sha === currentSnapshot.commitSha) {
     return {
       baselineCreated: false,
       repositoryUrl: normalizedUrl,
       branch: currentSnapshot.branch,
-      previousCommitSha: baseline.commitSha,
+      previousCommitSha: baseline.commit_sha,
       currentCommitSha: currentSnapshot.commitSha,
       currentCommitUrl: currentSnapshot.commitUrl,
       summary: {
@@ -144,7 +157,7 @@ export async function scanGitHubRepository({ githubUrl, storageRoot }) {
   }
 
   const compareData = await githubRequest(
-    `/repos/${owner}/${repo}/compare/${baseline.commitSha}...${currentSnapshot.commitSha}`
+    `/repos/${owner}/${repo}/compare/${baseline.commit_sha}...${currentSnapshot.commitSha}`
   );
   const changedFiles = (compareData.files ?? []).map((file) => ({
     path: file.filename,
@@ -157,13 +170,13 @@ export async function scanGitHubRepository({ githubUrl, storageRoot }) {
     blobUrl: file.blob_url ?? null
   }));
 
-  writeRepoBaseline(storageRoot, owner, repo, currentSnapshot);
+  await writeRepoBaseline(currentSnapshot);
 
   return {
     baselineCreated: false,
     repositoryUrl: normalizedUrl,
     branch: currentSnapshot.branch,
-    previousCommitSha: baseline.commitSha,
+    previousCommitSha: baseline.commit_sha,
     currentCommitSha: currentSnapshot.commitSha,
     currentCommitUrl: currentSnapshot.commitUrl,
     summary: summarizeFiles(changedFiles),

@@ -1,4 +1,3 @@
-import { readFileSync, writeFileSync } from "fs";
 import { PNG } from "pngjs";
 import pixelmatch from "pixelmatch";
 
@@ -24,11 +23,11 @@ function getVisualStatus(mismatchPercentage, thresholdPercentage) {
   return "Critical";
 }
 
-export function compareImages(baselinePath, currentPath, diffPath, options = {}) {
+export function compareImages(baselineBuffer, currentBuffer, options = {}) {
   const { threshold = 0.1, mismatchThresholdPercentage = 0.3 } = options;
 
-  const baseline = PNG.sync.read(readFileSync(baselinePath));
-  const current = PNG.sync.read(readFileSync(currentPath));
+  const baseline = PNG.sync.read(baselineBuffer);
+  const current = PNG.sync.read(currentBuffer);
 
   const width = Math.max(baseline.width, current.width);
   const height = Math.max(baseline.height, current.height);
@@ -46,7 +45,7 @@ export function compareImages(baselinePath, currentPath, diffPath, options = {})
     { threshold }
   );
 
-  writeFileSync(diffPath, PNG.sync.write(diff));
+  const diffBuffer = PNG.sync.write(diff);
 
   const totalPixels = width * height;
   const mismatchPercentage = Number(((mismatchPixels / totalPixels) * 100).toFixed(4));
@@ -55,6 +54,7 @@ export function compareImages(baselinePath, currentPath, diffPath, options = {})
     mismatchPixels,
     totalPixels,
     mismatchPercentage,
-    status: getVisualStatus(mismatchPercentage, mismatchThresholdPercentage)
+    status: getVisualStatus(mismatchPercentage, mismatchThresholdPercentage),
+    diffBuffer
   };
 }
