@@ -1,4 +1,4 @@
-import { chromium } from "playwright";
+import { launchBrowser } from "./browserService.js";
 
 function escapeHtml(value = "") {
   return String(value)
@@ -208,7 +208,7 @@ export function buildReportHtml(result) {
 
 export async function generateReportPdf(result) {
   const html = buildReportHtml(result);
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();

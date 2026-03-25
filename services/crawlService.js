@@ -1,4 +1,4 @@
-import { chromium } from "playwright";
+import { launchBrowser } from "./browserService.js";
 
 const VIEWPORTS = {
   desktop: { width: 1440, height: 900 },
@@ -66,7 +66,7 @@ export async function crawlSitePages({
 }) {
   const initialUrl = normalizePageUrl(startUrl);
   const origin = new URL(initialUrl).origin;
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser();
   const context = await browser.newContext({
     viewport: VIEWPORTS[viewport] ?? VIEWPORTS.desktop
   });

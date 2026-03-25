@@ -1,4 +1,4 @@
-import { chromium } from "playwright";
+import { launchBrowser } from "./browserService.js";
 
 const VIEWPORTS = {
   desktop: { width: 1440, height: 900 },
@@ -81,7 +81,7 @@ export async function captureScreenshot({
   viewport = "desktop",
   ignoredSelectors = []
 }) {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage({
