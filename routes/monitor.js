@@ -19,6 +19,7 @@ const STORAGE_UPLOAD_RETRY_DELAY_MS = Math.max(
   Number(process.env.STORAGE_UPLOAD_RETRY_DELAY_MS) || 1200
 );
 const scanJobs = new Map();
+const JOBS_TABLE = "scan_jobs";
 
 let scanBucketReadyPromise = null;
 
@@ -369,7 +370,76 @@ function updateJob(jobId, patch) {
   };
 
   scanJobs.set(jobId, next);
+  void persistJob(next).catch((error) => {
+    console.error("Failed to persist scan job update:", error);
+  });
   return next;
+}
+
+function toDbJobPayload(job) {
+  return {
+    job_id: job.jobId,
+    status: job.status,
+    progress_percentage: job.progressPercentage,
+    message: job.message,
+    website_id: job.websiteId,
+    site_name: job.siteName,
+    total_pages: job.totalPages,
+    completed_pages: job.completedPages,
+    current_page_url: job.currentPageUrl,
+    result: job.result,
+    error: job.error,
+    created_at: job.createdAt,
+    updated_at: job.updatedAt
+  };
+}
+
+function fromDbJobPayload(row) {
+  return {
+    jobId: row.job_id,
+    status: row.status,
+    progressPercentage: row.progress_percentage,
+    message: row.message,
+    websiteId: row.website_id,
+    siteName: row.site_name,
+    totalPages: row.total_pages,
+    completedPages: row.completed_pages,
+    currentPageUrl: row.current_page_url,
+    result: row.result,
+    error: row.error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+async function createJobRecord(job) {
+  const { error } = await supabase.from(JOBS_TABLE).insert(toDbJobPayload(job));
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+async function persistJob(job) {
+  const { error } = await supabase
+    .from(JOBS_TABLE)
+    .upsert(toDbJobPayload(job), { onConflict: "job_id" });
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+async function fetchJobRecord(jobId) {
+  const { data, error } = await supabase
+    .from(JOBS_TABLE)
+    .select("*")
+    .eq("job_id", jobId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return data ? fromDbJobPayload(data) : null;
 }
 
 async function scanPage({ website, pageUrl, timestamp }) {
@@ -729,15 +799,24 @@ router.get("/report/:scanId", async (req, res) => {
   }
 });
 
-router.get("/jobs/:jobId", (req, res) => {
+router.get("/jobs/:jobId", async (req, res) => {
   const jobId = req.params.jobId;
-  const job = scanJobs.get(jobId);
+  const memoryJob = scanJobs.get(jobId);
 
-  if (!job) {
-    return res.status(404).json({ error: "Scan job not found." });
+  if (memoryJob) {
+    return res.json(memoryJob);
   }
 
-  return res.json(job);
+  try {
+    const persistedJob = await fetchJobRecord(jobId);
+    if (!persistedJob) {
+      return res.status(404).json({ error: "Scan job not found." });
+    }
+    scanJobs.set(jobId, persistedJob);
+    return res.json(persistedJob);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Failed to fetch scan job." });
+  }
 });
 
 router.post("/", async (req, res) => {
@@ -766,6 +845,11 @@ router.post("/", async (req, res) => {
     updatedAt: new Date().toISOString()
   };
   scanJobs.set(jobId, job);
+  try {
+    await createJobRecord(job);
+  } catch (error) {
+    return res.status(500).json({ error: `Failed to create scan job: ${error.message}` });
+  }
 
   void runScanJob({
     jobId,

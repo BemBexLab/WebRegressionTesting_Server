@@ -29,6 +29,22 @@ create table if not exists public.scans (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.scan_jobs (
+  job_id uuid primary key,
+  status text not null default 'queued',
+  progress_percentage integer not null default 0,
+  message text not null default 'Queued',
+  website_id uuid references public.websites(id) on delete set null,
+  site_name text,
+  total_pages integer not null default 0,
+  completed_pages integer not null default 0,
+  current_page_url text,
+  result jsonb,
+  error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.page_baselines (
   id uuid primary key default gen_random_uuid(),
   website_id uuid not null references public.websites(id) on delete cascade,
@@ -55,6 +71,7 @@ create table if not exists public.code_repo_baselines (
 
 alter table public.websites enable row level security;
 alter table public.scans enable row level security;
+alter table public.scan_jobs enable row level security;
 alter table public.page_baselines enable row level security;
 alter table public.code_repo_baselines enable row level security;
 
@@ -67,6 +84,12 @@ using (true);
 drop policy if exists "Allow read scans" on public.scans;
 create policy "Allow read scans"
 on public.scans
+for select
+using (true);
+
+drop policy if exists "Allow read scan jobs" on public.scan_jobs;
+create policy "Allow read scan jobs"
+on public.scan_jobs
 for select
 using (true);
 
@@ -84,5 +107,6 @@ using (true);
 
 alter publication supabase_realtime add table public.websites;
 alter publication supabase_realtime add table public.scans;
+alter publication supabase_realtime add table public.scan_jobs;
 alter publication supabase_realtime add table public.page_baselines;
 alter publication supabase_realtime add table public.code_repo_baselines;
