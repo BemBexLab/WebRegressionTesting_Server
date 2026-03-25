@@ -372,6 +372,41 @@ function buildAggregateDomLog(pageResults) {
     .slice(0, 200);
 }
 
+function buildFailedPageResult({ pageUrl, error }) {
+  const pagePath = getPagePath(pageUrl);
+  const message = error instanceof Error ? error.message : String(error ?? "Page scan failed.");
+
+  return {
+    pageId: `failed-${hashString(pagePath)}`,
+    url: pageUrl,
+    path: pagePath,
+    baselineCreated: false,
+    visualRegression: {
+      mismatchPixels: 0,
+      totalPixels: 0,
+      mismatchPercentage: 0,
+      status: "Warning",
+      baselineImageUrl: "",
+      currentImageUrl: "",
+      diffImageUrl: null,
+      error: message
+    },
+    domRegression: {
+      summary: {
+        total: 0,
+        added: 0,
+        removed: 0,
+        attributeChanged: 0,
+        textChanged: 0,
+        severity: "None"
+      },
+      changedSelectors: [],
+      diffLog: [],
+      error: message
+    }
+  };
+}
+
 function updateJob(jobId, patch) {
   const existing = scanJobs.get(jobId);
 
@@ -663,11 +698,19 @@ async function runScanJob({ jobId, url, githubUrl }) {
         progressPercentage: Math.min(90, Math.round(30 + ((index / totalPages) * 60)))
       });
 
-      const pageResult = await scanPage({
-        website,
-        pageUrl,
-        timestamp
-      });
+      let pageResult;
+      try {
+        pageResult = await scanPage({
+          website,
+          pageUrl,
+          timestamp
+        });
+      } catch (pageError) {
+        pageResult = buildFailedPageResult({ pageUrl, error: pageError });
+        updateJob(jobId, {
+          message: `Skipped failed page ${index + 1}/${totalPages}: ${pageUrl}`
+        });
+      }
 
       pageResults.push(pageResult);
       updateJob(jobId, {

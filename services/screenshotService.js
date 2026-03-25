@@ -11,6 +11,7 @@ const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY_MS) || 150;
 const NETWORK_IDLE_TIMEOUT = Number(process.env.NETWORK_IDLE_TIMEOUT_MS) || 20000;
 const PAGE_GOTO_MAX_RETRIES = Number(process.env.PAGE_GOTO_MAX_RETRIES) || 5;
 const PAGE_GOTO_RETRY_DELAY_MS = Number(process.env.PAGE_GOTO_RETRY_DELAY_MS) || 5000;
+const SCREENSHOT_RETRIES = Math.max(1, Number(process.env.SCREENSHOT_RETRIES) || 3);
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -81,32 +82,63 @@ export async function captureScreenshot({
   viewport = "desktop",
   ignoredSelectors = []
 }) {
-  const browser = await launchBrowser();
+  let lastError = null;
 
-  try {
-    const page = await browser.newPage({
-      viewport: VIEWPORTS[viewport] ?? VIEWPORTS.desktop
-    });
+  for (let attempt = 1; attempt <= SCREENSHOT_RETRIES; attempt += 1) {
+    const browser = await launchBrowser();
 
-    await gotoWithRetry(page, url);
-    await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
-    await page.waitForLoadState("networkidle", { timeout: NETWORK_IDLE_TIMEOUT }).catch(() => {});
-    await page.waitForTimeout(POST_LOAD_DELAY);
-    await stabilizePage(page);
+    try {
+      const page = await browser.newPage({
+        viewport: VIEWPORTS[viewport] ?? VIEWPORTS.desktop
+      });
 
-    if (ignoredSelectors.length > 0) {
-      const css = ignoredSelectors
-        .map((selector) => `${selector} { visibility: hidden !important; }`)
-        .join("\n");
+      await gotoWithRetry(page, url);
+      await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+      await page.waitForLoadState("networkidle", { timeout: NETWORK_IDLE_TIMEOUT }).catch(() => {});
+      await page.waitForTimeout(POST_LOAD_DELAY);
+      await stabilizePage(page);
 
-      await page.addStyleTag({ content: css });
+      if (ignoredSelectors.length > 0) {
+        const css = ignoredSelectors
+          .map((selector) => `${selector} { visibility: hidden !important; }`)
+          .join("\n");
+
+        await page.addStyleTag({ content: css }).catch(() => {});
+      }
+
+      let imageBuffer;
+      try {
+        imageBuffer = await page.screenshot({
+          fullPage: true,
+          animations: "disabled",
+          caret: "hide"
+        });
+      } catch (fullPageError) {
+        // Fallback for Chromium shell crashes on some GPU/canvas-heavy pages.
+        imageBuffer = await page.screenshot({
+          fullPage: false,
+          animations: "disabled",
+          caret: "hide"
+        });
+      }
+
+      const html = await page.content();
+      return { html, imageBuffer };
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      const retryable =
+        /Target page, context or browser has been closed|ETXTBSY|Protocol error|CopyOutputResultSender/i.test(
+          message
+        );
+
+      if (!retryable || attempt === SCREENSHOT_RETRIES) {
+        break;
+      }
+    } finally {
+      await browser.close().catch(() => {});
     }
-
-    const imageBuffer = await page.screenshot({ fullPage: true });
-
-    const html = await page.content();
-    return { html, imageBuffer };
-  } finally {
-    await browser.close();
   }
+
+  throw lastError;
 }
