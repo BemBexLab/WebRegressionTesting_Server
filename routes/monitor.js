@@ -136,25 +136,34 @@ function isSupabaseObjectKey(value) {
 async function ensureScanBucket() {
   if (!scanBucketReadyPromise) {
     scanBucketReadyPromise = (async () => {
-      const { data: buckets, error: listError } = await supabase.storage.listBuckets();
-
-      if (listError) {
-        throw new Error(`Failed to list Supabase buckets: ${listError.message}`);
-      }
-
-      const exists = (buckets ?? []).some((bucket) => bucket.name === SUPABASE_SCAN_BUCKET);
-
-      if (exists) {
-        return;
-      }
-
       const { error: createError } = await supabase.storage.createBucket(SUPABASE_SCAN_BUCKET, {
         public: true
       });
 
-      if (createError && !/already exists/i.test(createError.message)) {
-        throw new Error(`Failed to create bucket '${SUPABASE_SCAN_BUCKET}': ${createError.message}`);
+      if (!createError) {
+        return;
       }
+
+      const createMessage = String(createError.message || "");
+      const alreadyExists = /already exists|duplicate|409/i.test(createMessage);
+      if (alreadyExists) {
+        return;
+      }
+
+      // Some projects return transient 500s for bucket metadata APIs.
+      // Verify bucket usability directly before failing.
+      if (/internal server error|500/i.test(createMessage)) {
+        const { error: verifyError } = await supabase
+          .storage
+          .from(SUPABASE_SCAN_BUCKET)
+          .list("", { limit: 1 });
+
+        if (!verifyError) {
+          return;
+        }
+      }
+
+      throw new Error(`Failed to initialize bucket '${SUPABASE_SCAN_BUCKET}': ${createMessage}`);
     })();
   }
 
