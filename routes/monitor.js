@@ -18,6 +18,10 @@ const STORAGE_UPLOAD_RETRY_DELAY_MS = Math.max(
   100,
   Number(process.env.STORAGE_UPLOAD_RETRY_DELAY_MS) || 1200
 );
+const CRAWL_TOTAL_TIMEOUT_MS = Math.max(
+  10000,
+  Number(process.env.CRAWL_TOTAL_TIMEOUT_MS) || 90000
+);
 const scanJobs = new Map();
 const JOBS_TABLE = "scan_jobs";
 
@@ -32,6 +36,10 @@ function normalizeErrorMessage(error) {
 
   if (raw.toLowerCase().includes("<html")) {
     return "Received an unexpected HTML error response from an external service. Check Supabase and network connectivity.";
+  }
+
+  if (/crawl timeout/i.test(raw)) {
+    return "Crawl timed out. The target site is too slow or blocked in serverless runtime. Reduce page scope or use a non-serverless backend worker.";
   }
 
   return raw;
@@ -603,18 +611,26 @@ async function runScanJob({ jobId, url, githubUrl }) {
       message: "Crawling pages"
     });
 
-    const discoveredPages = await crawlSitePages({
-      startUrl: normalizedRootUrl,
-      viewport: website.viewport || "desktop",
-      maxPages: MAX_PAGES_PER_SCAN,
-      onProgress: ({ currentUrl, visitedCount, discoveredCount, queuedCount }) => {
-        updateJob(jobId, {
-          currentPageUrl: currentUrl,
-          message: `Crawling pages: visited ${visitedCount}, found ${discoveredCount}, queued ${queuedCount}`,
-          progressPercentage: Math.min(29, Math.max(15, 15 + discoveredCount))
-        });
-      }
-    });
+    const discoveredPages = await Promise.race([
+      crawlSitePages({
+        startUrl: normalizedRootUrl,
+        viewport: website.viewport || "desktop",
+        maxPages: MAX_PAGES_PER_SCAN,
+        onProgress: ({ currentUrl, visitedCount, discoveredCount, queuedCount }) => {
+          updateJob(jobId, {
+            currentPageUrl: currentUrl,
+            message: `Crawling pages: visited ${visitedCount}, found ${discoveredCount}, queued ${queuedCount}`,
+            progressPercentage: Math.min(29, Math.max(15, 15 + discoveredCount))
+          });
+        }
+      }),
+      new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error(`Crawl timeout after ${CRAWL_TOTAL_TIMEOUT_MS}ms`)),
+          CRAWL_TOTAL_TIMEOUT_MS
+        );
+      })
+    ]);
 
     if (discoveredPages.length === 0) {
       throw new Error("No crawlable pages were found for this site.");
