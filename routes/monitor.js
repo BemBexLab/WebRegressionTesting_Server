@@ -27,6 +27,14 @@ const JOBS_TABLE = "scan_jobs";
 
 let scanBucketReadyPromise = null;
 
+function isServerlessRuntime() {
+  return (
+    process.env.VERCEL === "1" ||
+    Boolean(process.env.AWS_REGION) ||
+    Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME)
+  );
+}
+
 function normalizeErrorMessage(error) {
   const raw = error instanceof Error ? error.message : String(error ?? "Unknown scan failure.");
 
@@ -819,16 +827,35 @@ router.get("/jobs/:jobId", async (req, res) => {
   const jobId = req.params.jobId;
   const memoryJob = scanJobs.get(jobId);
 
-  if (memoryJob) {
-    return res.json(memoryJob);
-  }
-
   try {
-    const persistedJob = await fetchJobRecord(jobId);
+    const persistedJob = memoryJob ?? (await fetchJobRecord(jobId));
     if (!persistedJob) {
       return res.status(404).json({ error: "Scan job not found." });
     }
     scanJobs.set(jobId, persistedJob);
+
+    const shouldRunOnPoll =
+      isServerlessRuntime() &&
+      persistedJob.status === "queued" &&
+      persistedJob.result &&
+      typeof persistedJob.result === "object" &&
+      persistedJob.result.request &&
+      typeof persistedJob.result.request === "object";
+
+    if (shouldRunOnPoll) {
+      const requestPayload = persistedJob.result.request;
+      await runScanJob({
+        jobId,
+        url: requestPayload.url,
+        githubUrl: requestPayload.githubUrl
+      });
+      const latest = scanJobs.get(jobId) ?? (await fetchJobRecord(jobId));
+      if (!latest) {
+        return res.status(404).json({ error: "Scan job not found." });
+      }
+      return res.json(latest);
+    }
+
     return res.json(persistedJob);
   } catch (error) {
     return res.status(500).json({ error: error.message || "Failed to fetch scan job." });
@@ -855,7 +882,12 @@ router.post("/", async (req, res) => {
     totalPages: 0,
     completedPages: 0,
     currentPageUrl: null,
-    result: null,
+    result: {
+      request: {
+        url,
+        githubUrl: githubUrl || null
+      }
+    },
     error: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -867,11 +899,18 @@ router.post("/", async (req, res) => {
     return res.status(500).json({ error: `Failed to create scan job: ${error.message}` });
   }
 
-  void runScanJob({
-    jobId,
-    url,
-    githubUrl
-  });
+  if (!isServerlessRuntime()) {
+    void runScanJob({
+      jobId,
+      url,
+      githubUrl
+    });
+  } else {
+    updateJob(jobId, {
+      message: "Queued. Scan will start on first status poll.",
+      progressPercentage: 1
+    });
+  }
 
   return res.status(202).json({ jobId });
 });
