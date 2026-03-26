@@ -6,7 +6,7 @@ import monitorRoutes from "./routes/monitor.js";
 
 const app = express();
 const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS ||
-  "https://web-regression-testing-client.vercel.app,http://localhost:3000,http://127.0.0.1:3000")
+  "http://localhost:3000,http://127.0.0.1:3000")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);

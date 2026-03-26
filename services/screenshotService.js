@@ -5,12 +5,16 @@ const VIEWPORTS = {
   mobile: { width: 390, height: 844 }
 };
 
-const PAGE_GOTO_TIMEOUT = Number(process.env.PAGE_GOTO_TIMEOUT_MS) || 45000;
-const POST_LOAD_DELAY = Number(process.env.POST_LOAD_DELAY_MS) || 6000;
+const IS_SERVERLESS =
+  process.env.VERCEL === "1" || Boolean(process.env.AWS_REGION) || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+const PAGE_GOTO_TIMEOUT = Number(process.env.PAGE_GOTO_TIMEOUT_MS) || (IS_SERVERLESS ? 20000 : 45000);
+const POST_LOAD_DELAY = Number(process.env.POST_LOAD_DELAY_MS) || (IS_SERVERLESS ? 1500 : 6000);
 const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY_MS) || 150;
-const NETWORK_IDLE_TIMEOUT = Number(process.env.NETWORK_IDLE_TIMEOUT_MS) || 20000;
-const PAGE_GOTO_MAX_RETRIES = Number(process.env.PAGE_GOTO_MAX_RETRIES) || 5;
-const PAGE_GOTO_RETRY_DELAY_MS = Number(process.env.PAGE_GOTO_RETRY_DELAY_MS) || 5000;
+const NETWORK_IDLE_TIMEOUT =
+  Number(process.env.NETWORK_IDLE_TIMEOUT_MS) || (IS_SERVERLESS ? 7000 : 20000);
+const PAGE_GOTO_MAX_RETRIES = Number(process.env.PAGE_GOTO_MAX_RETRIES) || (IS_SERVERLESS ? 2 : 5);
+const PAGE_GOTO_RETRY_DELAY_MS =
+  Number(process.env.PAGE_GOTO_RETRY_DELAY_MS) || (IS_SERVERLESS ? 1000 : 5000);
 const SCREENSHOT_RETRIES = Math.max(1, Number(process.env.SCREENSHOT_RETRIES) || 3);
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

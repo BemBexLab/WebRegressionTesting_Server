@@ -10,17 +10,14 @@ import { captureScreenshot } from "../services/screenshotService.js";
 import { compareImages } from "../services/visualDiffService.js";
 
 const router = Router();
-const MAX_PAGES_PER_SCAN = Number(process.env.MAX_PAGES_PER_SCAN) || 0;
+const MAX_PAGES_PER_SCAN =
+  Number(process.env.MAX_PAGES_PER_SCAN) || 0;
 const PIXELMATCH_THRESHOLD = Number(process.env.PIXELMATCH_THRESHOLD) || 0.2;
 const SUPABASE_SCAN_BUCKET = process.env.SUPABASE_SCAN_BUCKET || "scan-artifacts";
 const STORAGE_UPLOAD_RETRIES = Math.max(1, Number(process.env.STORAGE_UPLOAD_RETRIES) || 4);
 const STORAGE_UPLOAD_RETRY_DELAY_MS = Math.max(
   100,
   Number(process.env.STORAGE_UPLOAD_RETRY_DELAY_MS) || 1200
-);
-const CRAWL_TOTAL_TIMEOUT_MS = Math.max(
-  10000,
-  Number(process.env.CRAWL_TOTAL_TIMEOUT_MS) || 90000
 );
 const scanJobs = new Map();
 const JOBS_TABLE = "scan_jobs";
@@ -46,8 +43,8 @@ function normalizeErrorMessage(error) {
     return "Received an unexpected HTML error response from an external service. Check Supabase and network connectivity.";
   }
 
-  if (/crawl timeout/i.test(raw)) {
-    return "Crawl timed out. The target site is too slow or blocked in serverless runtime. Reduce page scope or use a non-serverless backend worker.";
+  if (/page crashed|target page, context or browser has been closed/i.test(raw)) {
+    return "Browser crashed while scanning a page. The scan continued where possible; retry for this site or reduce page scope.";
   }
 
   return raw;
@@ -663,34 +660,25 @@ async function runScanJob({ jobId, url, githubUrl }) {
       message: "Crawling pages"
     });
 
-    const discoveredPages = await Promise.race([
-      crawlSitePages({
-        startUrl: normalizedRootUrl,
-        viewport: website.viewport || "desktop",
-        maxPages: MAX_PAGES_PER_SCAN,
-        onProgress: ({ currentUrl, visitedCount, discoveredCount, queuedCount }) => {
-          updateJob(jobId, {
-            currentPageUrl: currentUrl,
-            message: `Crawling pages: visited ${visitedCount}, found ${discoveredCount}, queued ${queuedCount}`,
-            progressPercentage: Math.min(29, Math.max(15, 15 + discoveredCount))
-          });
-        }
-      }),
-      new Promise((_, reject) => {
-        setTimeout(
-          () => reject(new Error(`Crawl timeout after ${CRAWL_TOTAL_TIMEOUT_MS}ms`)),
-          CRAWL_TOTAL_TIMEOUT_MS
-        );
-      })
-    ]);
+    const discoveredPages = await crawlSitePages({
+      startUrl: normalizedRootUrl,
+      viewport: website.viewport || "desktop",
+      maxPages: MAX_PAGES_PER_SCAN,
+      onProgress: ({ currentUrl, visitedCount, discoveredCount, queuedCount }) => {
+        updateJob(jobId, {
+          currentPageUrl: currentUrl,
+          message: `Crawling pages: visited ${visitedCount}, found ${discoveredCount}, queued ${queuedCount}`,
+          progressPercentage: Math.min(29, Math.max(15, 15 + discoveredCount))
+        });
+      }
+    });
 
-    if (discoveredPages.length === 0) {
-      throw new Error("No crawlable pages were found for this site.");
-    }
+    const pagesToScan =
+      discoveredPages.length > 0 ? discoveredPages : [normalizedRootUrl];
 
     const timestamp = Date.now();
     const pageResults = [];
-    const totalPages = discoveredPages.length;
+    const totalPages = pagesToScan.length;
 
     updateJob(jobId, {
       totalPages,
@@ -699,8 +687,8 @@ async function runScanJob({ jobId, url, githubUrl }) {
       message: `Found ${totalPages} page(s). Starting page scans`
     });
 
-    for (let index = 0; index < discoveredPages.length; index += 1) {
-      const pageUrl = discoveredPages[index];
+    for (let index = 0; index < pagesToScan.length; index += 1) {
+      const pageUrl = pagesToScan[index];
       updateJob(jobId, {
         currentPageUrl: pageUrl,
         message: `Scanning ${index + 1} of ${totalPages}: ${pageUrl}`,
