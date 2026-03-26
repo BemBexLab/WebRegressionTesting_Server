@@ -5,25 +5,29 @@ import cors from "cors";
 import monitorRoutes from "./routes/monitor.js";
 
 const app = express();
-const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS ||
-  "http://localhost:3000,http://127.0.0.1:3000")
+const configuredOrigins = (process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
-  .map((origin) => origin.trim())
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
+const defaultDevOrigins = ["http://localhost:3000", "http://127.0.0.1:3000"];
+const allowedOrigins = new Set([
+  ...configuredOrigins,
+  ...(process.env.NODE_ENV === "production" ? [] : defaultDevOrigins)
+]);
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error(`Origin not allowed by CORS: ${origin}`));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
-  })
-);
-app.options(/.*/, cors());
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin.replace(/\/+$/, ""))) {
+      return callback(null, true);
+    }
+    return callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+};
+
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(json({ limit: process.env.REQUEST_BODY_LIMIT || "20mb" }));
 
 app.use("/api/monitor", monitorRoutes);
